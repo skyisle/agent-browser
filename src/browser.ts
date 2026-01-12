@@ -517,28 +517,36 @@ export class BrowserManager {
     const launcher =
       browserType === 'firefox' ? firefox : browserType === 'webkit' ? webkit : chromium;
 
-    // Launch browser
-    this.browser = await launcher.launch({
+    // Launch browser - use temporary variable for atomic state update
+    const browser = await launcher.launch({
       headless: options.headless ?? true,
     });
 
-    // Create context with viewport
-    const context = await this.browser.newContext({
-      viewport: options.viewport ?? { width: 1280, height: 720 },
-    });
+    try {
+      // Create context with viewport
+      const context = await browser.newContext({
+        viewport: options.viewport ?? { width: 1280, height: 720 },
+      });
 
-    // Set default timeout to 10 seconds (Playwright default is 30s)
-    context.setDefaultTimeout(10000);
+      // Set default timeout to 10 seconds (Playwright default is 30s)
+      context.setDefaultTimeout(10000);
 
-    this.contexts.push(context);
+      // Create initial page
+      const page = await context.newPage();
 
-    // Create initial page
-    const page = await context.newPage();
-    this.pages.push(page);
-    this.activePageIndex = 0;
+      // All operations succeeded - now update state atomically
+      this.browser = browser;
+      this.contexts.push(context);
+      this.pages.push(page);
+      this.activePageIndex = 0;
 
-    // Automatically start console and error tracking
-    this.setupPageTracking(page);
+      // Automatically start console and error tracking
+      this.setupPageTracking(page);
+    } catch (error) {
+      // Clean up browser if context/page creation fails
+      await browser.close().catch(() => {});
+      throw error;
+    }
   }
 
   /**
