@@ -293,11 +293,14 @@ agent-browser snapshot -i -c -d 5         # Combine options
 | Option | Description |
 |--------|-------------|
 | `--session <name>` | Use isolated session (or `AGENT_BROWSER_SESSION` env) |
+| `--headers <json>` | Set HTTP headers scoped to the URL's origin |
+| `--executable-path <path>` | Custom browser executable (or `AGENT_BROWSER_EXECUTABLE_PATH` env) |
 | `--json` | JSON output (for agents) |
 | `--full, -f` | Full page screenshot |
 | `--name, -n` | Locator name filter |
 | `--exact` | Exact text match |
 | `--headed` | Show browser window (not headless) |
+| `--cdp <port>` | Connect via Chrome DevTools Protocol |
 | `--debug` | Debug output |
 
 ## Selectors
@@ -386,6 +389,93 @@ agent-browser open example.com --headed
 ```
 
 This opens a visible browser window instead of running headless.
+
+## Authenticated Sessions
+
+Use `--headers` to set HTTP headers for a specific origin, enabling authentication without login flows:
+
+```bash
+# Headers are scoped to api.example.com only
+agent-browser open api.example.com --headers '{"Authorization": "Bearer <token>"}'
+
+# Requests to api.example.com include the auth header
+agent-browser snapshot -i --json
+agent-browser click @e2
+
+# Navigate to another domain - headers are NOT sent (safe!)
+agent-browser open other-site.com
+```
+
+This is useful for:
+- **Skipping login flows** - Authenticate via headers instead of UI
+- **Switching users** - Start new sessions with different auth tokens
+- **API testing** - Access protected endpoints directly
+- **Security** - Headers are scoped to the origin, not leaked to other domains
+
+To set headers for multiple origins, use `--headers` with each `open` command:
+
+```bash
+agent-browser open api.example.com --headers '{"Authorization": "Bearer token1"}'
+agent-browser open api.acme.com --headers '{"Authorization": "Bearer token2"}'
+```
+
+For global headers (all domains), use `set headers`:
+
+```bash
+agent-browser set headers '{"X-Custom-Header": "value"}'
+```
+
+## Custom Browser Executable
+
+Use a custom browser executable instead of the bundled Chromium. This is useful for:
+- **Serverless deployment**: Use lightweight Chromium builds like `@sparticuz/chromium` (~50MB vs ~684MB)
+- **System browsers**: Use an existing Chrome/Chromium installation
+- **Custom builds**: Use modified browser builds
+
+### CLI Usage
+
+```bash
+# Via flag
+agent-browser --executable-path /path/to/chromium open example.com
+
+# Via environment variable
+AGENT_BROWSER_EXECUTABLE_PATH=/path/to/chromium agent-browser open example.com
+```
+
+### Serverless Example (Vercel/AWS Lambda)
+
+```typescript
+import chromium from '@sparticuz/chromium';
+import { BrowserManager } from 'agent-browser';
+
+export async function handler() {
+  const browser = new BrowserManager();
+  await browser.launch({
+    executablePath: await chromium.executablePath(),
+    headless: true,
+  });
+  // ... use browser
+}
+```
+
+## CDP Mode
+
+Connect to an existing browser via Chrome DevTools Protocol:
+
+```bash
+# Connect to Electron app
+agent-browser --cdp 9222 snapshot
+
+# Connect to Chrome with remote debugging
+# (Start Chrome with: google-chrome --remote-debugging-port=9222)
+agent-browser --cdp 9222 open about:blank
+```
+
+This enables control of:
+- Electron apps
+- Chrome/Chromium instances with remote debugging
+- WebView2 applications
+- Any browser exposing a CDP endpoint
 
 ## Architecture
 

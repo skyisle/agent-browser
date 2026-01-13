@@ -39,6 +39,7 @@ interface PageError {
  */
 export class BrowserManager {
   private browser: Browser | null = null;
+  private cdpPort: number | null = null;
   private contexts: BrowserContext[] = [];
   private pages: Page[] = [];
   private activePageIndex: number = 0;
@@ -51,6 +52,7 @@ export class BrowserManager {
   private isRecordingHar: boolean = false;
   private refMap: RefMap = {};
   private lastSnapshot: string = '';
+  private scopedHeaderRoutes: Map<string, (route: Route) => Promise<void>> = new Map();
 
   /**
    * Check if browser is launched
@@ -439,12 +441,82 @@ export class BrowserManager {
   }
 
   /**
-   * Set extra HTTP headers
+   * Set extra HTTP headers (global - all requests)
    */
   async setExtraHeaders(headers: Record<string, string>): Promise<void> {
     const context = this.contexts[0];
     if (context) {
       await context.setExtraHTTPHeaders(headers);
+    }
+  }
+
+  /**
+   * Set scoped HTTP headers (only for requests matching the origin)
+   * Uses route interception to add headers only to matching requests
+   */
+  async setScopedHeaders(origin: string, headers: Record<string, string>): Promise<void> {
+    const page = this.getPage();
+
+    // Build URL pattern from origin (e.g., "api.example.com" -> "**://api.example.com/**")
+    // Handle both full URLs and just hostnames
+    let urlPattern: string;
+    try {
+      const url = new URL(origin.startsWith('http') ? origin : `https://${origin}`);
+      // Match any protocol, the host, and any path
+      urlPattern = `**://${url.host}/**`;
+    } catch {
+      // If parsing fails, treat as hostname pattern
+      urlPattern = `**://${origin}/**`;
+    }
+
+    // Remove existing route for this origin if any
+    const existingHandler = this.scopedHeaderRoutes.get(urlPattern);
+    if (existingHandler) {
+      await page.unroute(urlPattern, existingHandler);
+    }
+
+    // Create handler that adds headers to matching requests
+    const handler = async (route: Route) => {
+      const requestHeaders = route.request().headers();
+      await route.continue({
+        headers: {
+          ...requestHeaders,
+          ...headers,
+        },
+      });
+    };
+
+    // Store and register the route
+    this.scopedHeaderRoutes.set(urlPattern, handler);
+    await page.route(urlPattern, handler);
+  }
+
+  /**
+   * Clear scoped headers for an origin (or all if no origin specified)
+   */
+  async clearScopedHeaders(origin?: string): Promise<void> {
+    const page = this.getPage();
+
+    if (origin) {
+      let urlPattern: string;
+      try {
+        const url = new URL(origin.startsWith('http') ? origin : `https://${origin}`);
+        urlPattern = `**://${url.host}/**`;
+      } catch {
+        urlPattern = `**://${origin}/**`;
+      }
+
+      const handler = this.scopedHeaderRoutes.get(urlPattern);
+      if (handler) {
+        await page.unroute(urlPattern, handler);
+        this.scopedHeaderRoutes.delete(urlPattern);
+      }
+    } else {
+      // Clear all scoped header routes
+      for (const [pattern, handler] of this.scopedHeaderRoutes) {
+        await page.unroute(pattern, handler);
+      }
+      this.scopedHeaderRoutes.clear();
     }
   }
 
@@ -503,12 +575,50 @@ export class BrowserManager {
   }
 
   /**
+   * Check if an existing CDP connection is still alive
+   * by verifying we can access browser contexts and that at least one has pages
+   */
+  private isCdpConnectionAlive(): boolean {
+    if (!this.browser) return false;
+    try {
+      const contexts = this.browser.contexts();
+      if (contexts.length === 0) return false;
+      return contexts.some((context) => context.pages().length > 0);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if CDP connection needs to be re-established
+   */
+  private needsCdpReconnect(cdpPort: number): boolean {
+    if (!this.browser?.isConnected()) return true;
+    if (this.cdpPort !== cdpPort) return true;
+    if (!this.isCdpConnectionAlive()) return true;
+    return false;
+  }
+
+  /**
    * Launch the browser with the specified options
    * If already launched, this is a no-op (browser stays open)
    */
   async launch(options: LaunchCommand): Promise<void> {
-    // If already launched, don't relaunch
+    const cdpPort = options.cdpPort;
+
     if (this.browser) {
+      const switchingFromCdpToBrowser = !cdpPort && this.cdpPort !== null;
+      const needsCdpReconnect = !!cdpPort && this.needsCdpReconnect(cdpPort);
+
+      if (switchingFromCdpToBrowser || needsCdpReconnect) {
+        await this.close();
+      } else {
+        return;
+      }
+    }
+
+    if (cdpPort) {
+      await this.connectViaCDP(cdpPort);
       return;
     }
 
@@ -520,11 +630,14 @@ export class BrowserManager {
     // Launch browser
     this.browser = await launcher.launch({
       headless: options.headless ?? true,
+      executablePath: options.executablePath,
     });
+    this.cdpPort = null;
 
-    // Create context with viewport
+    // Create context with viewport and optional headers
     const context = await this.browser.newContext({
       viewport: options.viewport ?? { width: 1280, height: 720 },
+      extraHTTPHeaders: options.headers,
     });
 
     // Set default timeout to 10 seconds (Playwright default is 30s)
@@ -542,7 +655,56 @@ export class BrowserManager {
   }
 
   /**
-   * Set up console and error tracking for a page
+   * Connect to a running browser via CDP (Chrome DevTools Protocol)
+   */
+  private async connectViaCDP(cdpPort: number | undefined): Promise<void> {
+    if (!cdpPort) {
+      throw new Error('cdpPort is required for CDP connection');
+    }
+
+    const browser = await chromium.connectOverCDP(`http://localhost:${cdpPort}`).catch(() => {
+      throw new Error(
+        `Failed to connect via CDP on port ${cdpPort}. ` +
+          `Make sure the app is running with --remote-debugging-port=${cdpPort}`
+      );
+    });
+
+    // Validate and set up state, cleaning up browser connection if anything fails
+    try {
+      const contexts = browser.contexts();
+      if (contexts.length === 0) {
+        throw new Error('No browser context found. Make sure the app has an open window.');
+      }
+
+      const allPages = contexts.flatMap((context) => context.pages());
+      if (allPages.length === 0) {
+        throw new Error('No page found. Make sure the app has loaded content.');
+      }
+
+      // All validation passed - commit state
+      this.browser = browser;
+      this.cdpPort = cdpPort;
+
+      for (const context of contexts) {
+        this.contexts.push(context);
+        this.setupContextTracking(context);
+      }
+
+      for (const page of allPages) {
+        this.pages.push(page);
+        this.setupPageTracking(page);
+      }
+
+      this.activePageIndex = 0;
+    } catch (error) {
+      // Clean up browser connection if validation or setup failed
+      await browser.close().catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * Set up console, error, and close tracking for a page
    */
   private setupPageTracking(page: Page): void {
     page.on('console', (msg) => {
@@ -558,6 +720,26 @@ export class BrowserManager {
         message: error.message,
         timestamp: Date.now(),
       });
+    });
+
+    page.on('close', () => {
+      const index = this.pages.indexOf(page);
+      if (index !== -1) {
+        this.pages.splice(index, 1);
+        if (this.activePageIndex >= this.pages.length) {
+          this.activePageIndex = Math.max(0, this.pages.length - 1);
+        }
+      }
+    });
+  }
+
+  /**
+   * Set up tracking for new pages in a context (for CDP connections)
+   */
+  private setupContextTracking(context: BrowserContext): void {
+    context.on('page', (page) => {
+      this.pages.push(page);
+      this.setupPageTracking(page);
     });
   }
 
@@ -672,21 +854,29 @@ export class BrowserManager {
    * Close the browser and clean up
    */
   async close(): Promise<void> {
-    for (const page of this.pages) {
-      await page.close().catch(() => {});
+    // CDP: only disconnect, don't close external app's pages
+    if (this.cdpPort !== null) {
+      if (this.browser) {
+        await this.browser.close().catch(() => {});
+        this.browser = null;
+      }
+    } else {
+      // Regular browser: close everything
+      for (const page of this.pages) {
+        await page.close().catch(() => {});
+      }
+      for (const context of this.contexts) {
+        await context.close().catch(() => {});
+      }
+      if (this.browser) {
+        await this.browser.close().catch(() => {});
+        this.browser = null;
+      }
     }
+
     this.pages = [];
-
-    for (const context of this.contexts) {
-      await context.close().catch(() => {});
-    }
     this.contexts = [];
-
-    if (this.browser) {
-      await this.browser.close().catch(() => {});
-      this.browser = null;
-    }
-
+    this.cdpPort = null;
     this.activePageIndex = 0;
     this.refMap = {};
     this.lastSnapshot = '';
